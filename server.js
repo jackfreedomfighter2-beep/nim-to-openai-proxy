@@ -520,6 +520,202 @@ async function validateModels() {
             alias,
             nimId,
             error: `${status} ${msg}`
+// server.js - Hybrid OpenAI ↔ NIM Proxy
+// Fixed: stream death, JSON vomit, silent buffer loss, missing error propagation
+
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { StringDecoder } = require('string_decoder');
+const { timingSafeEqual } = require('crypto');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+app.use((req, res, next) => {
+  if (req.path === '/health' || req.path === '/v1/models') {
+    return next();
+  }
+
+  const auth = req.headers.authorization?.trim();
+  const expected = `Bearer ${process.env.CLIENT_AUTH_KEY}`;
+
+  if (!auth || !expected || auth.length !== expected.length) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  const authBuf = Buffer.from(auth);
+  const expectedBuf = Buffer.from(expected);
+
+  if (!timingSafeEqual(authBuf, expectedBuf)) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  next();
+});
+
+
+const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_KEY = process.env.NIM_API_KEY;
+
+// Toggles - env-configurable for phone-editing at 2am
+const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
+const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
+
+const MAX_TOKENS_LIMIT = 65536;
+
+if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
+if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
+
+const MODEL_MAPPING = {
+  'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
+  'gpt-3.5-ultra': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
+  'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
+  'gpt-4-turbo': 'moonshotai/kimi-k2.6',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
+  'claude-3-opus': 'openai/gpt-oss-120b',
+  'claude-3-sonnet': 'openai/gpt-oss-20b',
+  'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  'gemini-turbo': 'meta/llama-3.3-70b-instruct',
+  'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
+  'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
+  'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'glm-5.1': 'z-ai/glm-5.1',
+  'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
+  'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
+  'mistral-pro': 'mistralai/mistral-small-4-119b-2603',
+  'mistral-nemo': 'mistralai/mistral-nemotron',
+  'mistral-fast': 'mistralai/ministral-14b-instruct-2512',
+  'google-light': 'google/gemma-4-31b-it',
+  'google-lightest': 'google/gemma-2-2b-it',
+  'google-lighter': 'google/gemma-3n-e4b-it',
+  'm2.7': 'minimaxai/minimax-m2.7',
+  'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
+  'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
+};
+
+const FALLBACK_MODELS = [
+  'mistralai/mistral-medium-3.5-128b',
+  'mistralai/mistral-small-4-119b-2603',
+  'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  'google/gemma-4-31b-it'
+];
+
+// You can delete this part from your fork if you don't trust it since it calls on a discord webhook.
+// The webhook is an env variable, and is just used to check if the models are valid.
+
+const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+
+const SKIP_VALIDATION_MODELS = ['deepseek-ai/deepseek-v4-pro'];
+
+async function sendDiscordAlert(invalidModels) {
+  if (!DISCORD_WEBHOOK_URL) return;
+
+  const embed = {
+    title: '⚠️ NIM Proxy: Model Validation Failed',
+    description: `${invalidModels.length} model(s) failed validation. Check NIM catalog for deprecations.`,
+    color: 0xff4444,
+    timestamp: new Date().toISOString(),
+    fields: invalidModels.map(m => ({
+      name: `\`${m.alias}\``,
+      value: `Backend: \`${m.nimId}\`\nError: \`${m.error}\``,
+      inline: true
+    }))
+  };
+
+  try {
+    await axios.post(DISCORD_WEBHOOK_URL, {
+      embeds: [embed],
+      username: 'NIM Proxy Monitor'
+    });
+
+    console.log('[DISCORD] Alert sent.');
+  } catch (err) {
+    console.error('[DISCORD] Failed to send alert:', err.message);
+  }
+}
+
+async function validateModels() {
+  if (SKIP_VALIDATION) {
+    console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
+    return;
+  }
+
+  console.log('[VALIDATION] Checking model availability...');
+  const invalid = [];
+
+  for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
+    if (SKIP_VALIDATION_MODELS.includes(nimId)) {
+      console.log(`[VALIDATION] ⊘ ${alias} → ${nimId} (skipped — known slow)`);
+      continue;
+    }
+
+    let succeeded = false;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await axios.post(
+          `${NIM_API_BASE}/chat/completions`,
+          {
+            model: nimId,
+            messages: [{ role: 'user', content: 'hi' }],
+            max_tokens: 1
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${NIM_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: 60000
+          }
+        );
+
+        console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
+        succeeded = true;
+        break;
+
+      } catch (err) {
+        const isTimeout =
+          err.code === 'ECONNABORTED' ||
+          err.message?.includes('timeout');
+
+        const isLastAttempt = attempt === 2;
+
+        if (isTimeout && !isLastAttempt) {
+          console.warn(`[VALIDATION] Timeout on ${alias}, retrying...`);
+          continue;
+        }
+
+        if (isLastAttempt) {
+          const status = err.response?.status;
+          const msg =
+            err.response?.data?.error?.message || err.message;
+
+          console.error(
+            `[VALIDATION] ✗ ${alias} → ${nimId} | ${status} ${msg}`
+          );
+
+          invalid.push({
+            alias,
+            nimId,
+            error: `${status} ${msg}`
           });
         }
       }
