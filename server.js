@@ -1,5 +1,7 @@
-// server.js - Hybrid OpenAI ↔ NIM Proxy
-// Fixed: stream death, JSON vomit, silent buffer loss, missing error propagation
+// server.js — Robust Hybrid OpenAI ↔ NIM Proxy
+// Express 5 Compatible
+// Fixes: auth bypass, startup DDoS, silent stream failures, memory leaks, Express 5 deprecations
+// PATCH: Universal thinking model support (DeepSeek, Qwen, Nemotron, Kimi, GLM, MiniMax)
 
 const express = require('express');
 const cors = require('cors');
@@ -10,60 +12,54 @@ const { timingSafeEqual } = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models') {
-    return next();
-  }
-
-  const auth = req.headers.authorization?.trim();
-  const expected = `Bearer ${process.env.CLIENT_AUTH_KEY}`;
-
-  if (!auth || !expected || auth.length !== expected.length) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
-  const authBuf = Buffer.from(auth);
-  const expectedBuf = Buffer.from(expected);
-
-  if (!timingSafeEqual(authBuf, expectedBuf)) {
-    return res.status(403).json({
-      error: {
-        message: 'Forbidden',
-        type: 'authentication_error',
-        code: 403
-      }
-    });
-  }
-
-  next();
-});
-
+// ─── Configuration ───────────────────────────────────────────────────────────
 
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
+const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
 
-// Toggles - env-configurable for phone-editing at 2am
 const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
 const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
+const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+
+// NEW: Configurable reasoning effort for DeepSeek V4 models
+// Options: 'low', 'medium', 'high', 'max' (default: 'high')
+const REASONING_EFFORT = process.env.REASONING_EFFORT || 'high';
+const VALID_REASONING_EFFORTS = ['low', 'medium', 'high', 'max'];
 
 const MAX_TOKENS_LIMIT = 65536;
+const REQUEST_TIMEOUT_MS = 180000;
+const VALIDATION_TIMEOUT_MS = 15000;
+const MAX_BUFFER_SIZE = 1024 * 1024;
 
 if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
 
+// Validate reasoning effort
+if (ENABLE_THINKING_MODE && !VALID_REASONING_EFFORTS.includes(REASONING_EFFORT)) {
+  console.warn(`[WARN] Invalid REASONING_EFFORT="${REASONING_EFFORT}". Must be one of: ${VALID_REASONING_EFFORTS.join(', ')}. Falling back to 'high'.`);
+}
+
+// ─── Config validation ──────────────────────────────────────────────────────
+
+function validateConfig() {
+  const fatal = (msg) => { console.error(`[FATAL] ${msg}`); process.exit(1); };
+  
+  if (!NIM_API_KEY) fatal('NIM_API_KEY is required. Get one at https://build.nvidia.com/');
+  
+  if (!CLIENT_AUTH_KEY) {
+    console.warn('[WARN] CLIENT_AUTH_KEY not set. All requests will be rejected with 403.');
+  }
+}
+
+validateConfig();
+
+// ─── Model Mapping ─────────────────────────────────────────────────────────
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
-  'gpt-3.5-ultra': 'nvidia/nemotron-3-ultra-550b-a55b',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
+  'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
   'gpt-4-turbo': 'moonshotai/kimi-k2.6',
   'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
@@ -84,6 +80,7 @@ const MODEL_MAPPING = {
   'google-lightest': 'google/gemma-2-2b-it',
   'google-lighter': 'google/gemma-3n-e4b-it',
   'm2.7': 'minimaxai/minimax-m2.7',
+  'm3': 'minimaxai/minimax-m3',
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
   'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
 };
@@ -95,13 +92,118 @@ const FALLBACK_MODELS = [
   'google/gemma-4-31b-it'
 ];
 
-// You can delete this part from your fork if you don't trust it since it calls on a discord webhook.
-// The webhook is an env variable, and is just used to check if the models are valid.
+// PATCH: ─── Thinking Model Configuration ───────────────────────────────────
 
-const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const THINKING_MODEL_CONFIG = {
+  'deepseek-ai/deepseek-v4-pro': { mode: 'auto', param: null },
+  'deepseek-ai/deepseek-v4-flash': { mode: 'auto', param: null },
+  'qwen/qwen3.5-397b-a17b': { mode: 'hybrid', param: 'enable_thinking' },
+  'nvidia/nemotron-3-super-120b-a12b': { mode: 'prompt', param: null },
+  'nvidia/nemotron-3-ultra-550b-a55b': { mode: 'prompt', param: null },
+  'moonshotai/kimi-k2.6': { mode: 'auto', param: null },
+  'z-ai/glm-5.1': { mode: 'auto', param: null },
+  'minimaxai/minimax-m2.7': { mode: 'auto', param: null },
+  'minimaxai/minimax-m3': { mode: 'auto', param: null },
+  'stepfun-ai/step-3.5-flash': { mode: 'auto', param: null },
+  'stepfun-ai/step-3.7-flash': { mode: 'auto', param: null },
+};
 
-const SKIP_VALIDATION_MODELS = ['deepseek-ai/deepseek-v4-pro'];
+// ─── Middleware ─────────────────────────────────────────────────────────────
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+function extractBearerToken(authHeader) {
+  if (!authHeader || typeof authHeader !== 'string') return null;
+  const parts = authHeader.trim().split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return null;
+  return parts[1];
+}
+
+function safeTimingEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
+    return false;
+  }
+}
+
+app.use((req, res, next) => {
+  if (req.path === '/health' || req.path === '/v1/models') {
+    return next();
+  }
+
+  const token = extractBearerToken(req.headers.authorization);
+  
+  if (!token || !CLIENT_AUTH_KEY) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid or missing authentication',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
+    return res.status(403).json({
+      error: {
+        message: 'Forbidden: Invalid authentication credentials',
+        type: 'authentication_error',
+        code: 403
+      }
+    });
+  }
+
+  next();
+});
+
+// ─── Validation ─────────────────────────────────────────────────────────────
+
+async function validateModels() {
+  if (SKIP_VALIDATION) {
+    console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
+    return;
+  }
+
+  console.log('[VALIDATION] Checking model availability via /v1/models...');
+
+  try {
+    const response = await axios.get(`${NIM_API_BASE}/models`, {
+      headers: {
+        Authorization: `Bearer ${NIM_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: VALIDATION_TIMEOUT_MS
+    });
+
+    const availableModels = new Set(
+      (response.data.data || []).map(m => m.id)
+    );
+
+    const invalid = [];
+    
+    for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
+      if (availableModels.has(nimId)) {
+        console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
+      } else {
+        console.warn(`[VALIDATION] ✗ ${alias} → ${nimId} (not in catalog)`);
+        invalid.push({ alias, nimId, error: 'Model not found in NIM catalog' });
+      }
+    }
+
+    if (invalid.length > 0) {
+      await sendDiscordAlert(invalid);
+    } else {
+      console.log('[VALIDATION] All models valid.');
+    }
+
+  } catch (err) {
+    console.warn(`[VALIDATION] /v1/models endpoint failed: ${err.message}. Skipping validation.`);
+    console.warn('[VALIDATION] Consider setting SKIP_VALIDATION=true if your NIM provider lacks a model listing endpoint.');
+  }
+}
 
 async function sendDiscordAlert(invalidModels) {
   if (!DISCORD_WEBHOOK_URL) return;
@@ -122,106 +224,171 @@ async function sendDiscordAlert(invalidModels) {
     await axios.post(DISCORD_WEBHOOK_URL, {
       embeds: [embed],
       username: 'NIM Proxy Monitor'
-    });
-
+    }, { timeout: 5000 });
     console.log('[DISCORD] Alert sent.');
   } catch (err) {
     console.error('[DISCORD] Failed to send alert:', err.message);
   }
 }
 
-async function validateModels() {
-  if (SKIP_VALIDATION) {
-    console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
-    return;
-  }
+// ─── Helper: Safe Stream Writing ───────────────────────────────────────────
 
-  console.log('[VALIDATION] Checking model availability...');
-  const invalid = [];
-
-  for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
-    if (SKIP_VALIDATION_MODELS.includes(nimId)) {
-      console.log(`[VALIDATION] ⊘ ${alias} → ${nimId} (skipped — known slow)`);
-      continue;
+function safeWrite(res, data) {
+  try {
+    if (!res.writableEnded && !res.destroyed && res.writable) {
+      res.write(data);
+      return true;
     }
+  } catch (err) {
+    console.warn('[STREAM] Write failed:', err.message);
+  }
+  return false;
+}
 
-    let succeeded = false;
+// PATCH: ─── Helper: Extract content from thinking model responses ───────────
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await axios.post(
-          `${NIM_API_BASE}/chat/completions`,
-          {
-            model: nimId,
-            messages: [{ role: 'user', content: 'hi' }],
-            max_tokens: 1
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${NIM_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 60000
-          }
+function extractThinkingContent(message) {
+  if (!message) return { content: '', reasoning: null, isPromoted: false };
+  
+  let content = message.content || '';
+  // NIM uses 'reasoning' for some models, 'reasoning_content' for others
+  let reasoning = message.reasoning_content || message.reasoning || null;
+  let isPromoted = false;
+  
+  // If NIM didn't populate reasoning fields, try to extract from content
+  if (!reasoning && content) {
+    const thinkMatch = content.match(/<thinking>([\s\S]*?)<\/thinking>/);
+    if (thinkMatch) {
+      reasoning = thinkMatch[1].trim();
+      content = content.replace(/<thinking>[\s\S]*?<\/thinking>/, '').trim();
+    }
+  }
+  
+  if (!content && reasoning) {
+    content = reasoning;
+    reasoning = null;
+    isPromoted = true;
+  }
+  
+  return { content, reasoning, isPromoted };
+}
+
+
+
+// PATCH: ─── Helper: Format content with reasoning for display ─────────────
+
+function formatWithReasoning(content, reasoning, showReasoning) {
+  if (!showReasoning || !reasoning) return content;
+  if (content.includes('<thinking>')) return content;
+  const safeReasoning = reasoning.replace(/\n/g, '\\n');
+  return `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
+}
+
+// PATCH: ─── Helper: Build thinking-aware request ───────────────────────────
+// FIX: DeepSeek V4 on NIM requires chat_template_kwargs at ROOT level, not extra_body
+//      or the API hangs indefinitely without returning anything.
+
+function buildThinkingRequest(baseRequest, modelId, enableThinking) {
+  const config = THINKING_MODEL_CONFIG[modelId];
+  if (!config) return baseRequest;
+  
+  const chatTemplateKwargs = {};
+  
+  switch (config.mode) {
+    case 'hybrid':
+      if (enableThinking !== undefined) {
+        const extraBody = baseRequest.extra_body ? { ...baseRequest.extra_body } : {};
+        extraBody[config.param] = enableThinking;
+        console.log(`[THINKING] ${modelId}: set ${config.param}=${enableThinking}`);
+        return {
+          ...baseRequest,
+          extra_body: extraBody
+        };
+      }
+      break;
+      
+    case 'prompt':
+      if (enableThinking) {
+        const hasThinkingPrompt = baseRequest.messages?.some(
+          m => m.role === 'system' && 
+               (m.content?.toLowerCase().includes('detailed thinking') || 
+                m.content?.toLowerCase().includes('thinking on'))
         );
-
-        console.log(`[VALIDATION] ✓ ${alias} → ${nimId}`);
-        succeeded = true;
-        break;
-
-      } catch (err) {
-        const isTimeout =
-          err.code === 'ECONNABORTED' ||
-          err.message?.includes('timeout');
-
-        const isLastAttempt = attempt === 2;
-
-        if (isTimeout && !isLastAttempt) {
-          console.warn(`[VALIDATION] Timeout on ${alias}, retrying...`);
-          continue;
-        }
-
-        if (isLastAttempt) {
-          const status = err.response?.status;
-          const msg =
-            err.response?.data?.error?.message || err.message;
-
-          console.error(
-            `[VALIDATION] ✗ ${alias} → ${nimId} | ${status} ${msg}`
-          );
-
-          invalid.push({
-            alias,
-            nimId,
-            error: `${status} ${msg}`
-          });
+        if (!hasThinkingPrompt) {
+          console.warn(`[THINKING] ${modelId}: This model requires a system prompt with "detailed thinking on" to enable reasoning.`);
         }
       }
+      return baseRequest;
+      
+    case 'auto':
+      if (enableThinking) {
+        // DeepSeek V4, Kimi K2.6, GLM-5, MiniMax, Step — need chat_template_kwargs at ROOT
+        // NIM strictly requires this or the API hangs indefinitely
+        chatTemplateKwargs.thinking = true;
+        
+        // DeepSeek V4 specifically supports configurable reasoning effort
+        if (modelId.includes('deepseek-v4')) {
+          const effort = VALID_REASONING_EFFORTS.includes(REASONING_EFFORT) 
+            ? REASONING_EFFORT 
+            : 'high';
+          chatTemplateKwargs.reasoning_effort = effort;
+        }
+        
+        console.log(`[THINKING] ${modelId}: Injected chat_template_kwargs at root level`);
+      }
+      break;
+  }
+  
+  const result = { ...baseRequest };
+  
+  if (Object.keys(chatTemplateKwargs).length > 0) {
+    result.chat_template_kwargs = chatTemplateKwargs;
+  }
+  
+  return result;
+}
+
+// ─── Helper: Fallback Chain ─────────────────────────────────────────────────
+
+async function callWithFallback(baseRequest, models) {
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const thinkingRequest = buildThinkingRequest(baseRequest, model, ENABLE_THINKING_MODE);
+      
+      const res = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        thinkingRequest,
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: baseRequest.stream ? 'stream' : 'json',
+          timeout: REQUEST_TIMEOUT_MS
+        }
+      );
+
+      return { response: res, model };
+
+    } catch (err) {
+      lastError = err;
+      console.warn(
+        `[FALLBACK] Model failed: ${model}`,
+        err.response?.status,
+        err.response?.data?.error?.message || err.message
+      );
     }
   }
 
-  if (invalid.length > 0) {
-    console.warn(`[VALIDATION] ${invalid.length} model(s) failed:`);
-
-    for (const m of invalid) {
-      console.warn(`  - ${m.alias}: ${m.error}`);
-    }
-
-    await sendDiscordAlert(invalid);
-
-  } else {
-    console.log('[VALIDATION] All models valid.');
-  }
+  throw lastError || new Error('All models failed');
 }
 
-if (!SKIP_VALIDATION) {
-  validateModels().catch(err => {
-    console.error('[VALIDATION] Check failed:', err.message);
-  });
-}
+// ─── Routes ────────────────────────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', version: '2.2.0' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -236,38 +403,9 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-async function callWithFallback(baseRequest, models) {
-  for (const model of models) {
-    try {
-      const res = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model },
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: 180000
-        }
-      );
-
-      return { response: res, model };
-
-    } catch (err) {
-      console.warn(
-        `[FALLBACK] Model failed: ${model}`,
-        err.response?.status,
-        err.response?.data?.error?.message || err.message
-      );
-    }
-  }
-
-  throw new Error('All models failed');
-}
-
 app.post('/v1/chat/completions', async (req, res) => {
   let streamEndedCleanly = false;
+  let upstreamStream = null;
 
   try {
     const {
@@ -278,37 +416,27 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-    const primaryModel =
-      MODEL_MAPPING[model] ||
-      'nvidia/llama-3.3-nemotron-super-49b-v1.5';
-
-    const modelChain = [
-      primaryModel,
-      ...FALLBACK_MODELS
-    ];
+    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+    const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
     const baseRequest = {
       messages,
+      model: primaryModel,
       temperature: temperature ?? 0.7,
-      max_tokens: Math.min(
-        max_tokens ?? 2048,
-        MAX_TOKENS_LIMIT
-      ),
+      max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
+      top_p: req.body.top_p,
+      frequency_penalty: req.body.frequency_penalty,
+      presence_penalty: req.body.presence_penalty,
+      stop: req.body.stop,
       stream: stream || false,
-      extra_body: ENABLE_THINKING_MODE
-        ? {
-            chat_template_kwargs: {
-              thinking: true
-            }
-          }
-        : undefined
+      tools: req.body.tools,
+      tool_choice: req.body.tool_choice,
+      response_format: req.body.response_format,
+      extra_body: undefined
     };
 
-    const {
-      response,
-      model: usedModel
-    } = await callWithFallback(baseRequest, modelChain);
-
+    const { response, model: usedModel } = await callWithFallback(baseRequest, modelChain);
+    upstreamStream = response.data;
     console.log('[PROXY] Model used:', usedModel);
 
     if (stream) {
@@ -316,22 +444,29 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      // FIX: Proper UTF-8-safe decoding without corrupting split multibyte chars
       const decoder = new StringDecoder('utf8');
-
       let buffer = '';
       let reasoningOpen = false;
       let doneSent = false;
+      let cleanedUp = false;
+
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (upstreamStream) {
+          upstreamStream.removeAllListeners();
+        }
+        req.removeAllListeners('close');
+      };
 
       const processLine = (line) => {
         if (!line.startsWith('data: ')) return;
 
         if (line.includes('[DONE]')) {
           if (!doneSent) {
-            res.write('data: [DONE]\n\n');
+            safeWrite(res, 'data: [DONE]\n\n');
             doneSent = true;
           }
-
           streamEndedCleanly = true;
           return;
         }
@@ -341,14 +476,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           const delta = data.choices?.[0]?.delta;
 
           if (delta) {
-            let content = delta.content || '';
-            const reasoning = delta.reasoning_content;
+            const { content: extractedContent, reasoning, isPromoted } = extractThinkingContent(delta);
+            let content = extractedContent;
 
-            if (SHOW_REASONING) {
+            if (SHOW_REASONING && reasoning && !isPromoted) {
               if (reasoning && !reasoningOpen) {
                 content = `<thinking>\n${reasoning.replace(/\n/g, '\\n')}`;
                 reasoningOpen = true;
-
               } else if (reasoning) {
                 content = reasoning.replace(/\n/g, '\\n');
               }
@@ -363,23 +497,39 @@ app.post('/v1/chat/completions', async (req, res) => {
             delete delta.reasoning_content;
           }
 
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
+          safeWrite(res, `data: ${JSON.stringify(data)}\n\n`);
 
         } catch (parseErr) {
-          console.warn(
-            '[STREAM] Skipped invalid JSON line:',
-            line.slice(0, 100)
-          );
+          console.warn('[STREAM] Invalid JSON line:', line.slice(0, 100));
+          safeWrite(res, `data: ${JSON.stringify({ 
+            error: { 
+              message: 'Upstream sent malformed chunk', 
+              type: 'stream_parse_error',
+              details: line.slice(0, 100)
+            } 
+          })}\n\n`);
         }
       };
 
-      response.data.on('data', chunk => {
-        // Proper UTF-8-safe decoding
+      upstreamStream.on('data', chunk => {
         buffer += decoder.write(chunk);
 
-        const lines = buffer.split('\n');
+        if (buffer.length > MAX_BUFFER_SIZE) {
+          console.error('[STREAM] Buffer overflow, destroying connection');
+          safeWrite(res, `data: ${JSON.stringify({ 
+            error: { 
+              message: 'Stream buffer overflow', 
+              type: 'stream_error' 
+            } 
+          })}\n\n`);
+          safeWrite(res, 'data: [DONE]\n\n');
+          res.end();
+          upstreamStream.destroy();
+          cleanup();
+          return;
+        }
 
-        // Keep incomplete line for next chunk
+        const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
         for (const line of lines) {
@@ -387,56 +537,53 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       });
 
-      response.data.on('end', () => {
-        // Flush remaining UTF-8 decoder bytes
+      upstreamStream.on('end', () => {
         buffer += decoder.end();
 
-        // Process any leftover lines
         if (buffer.trim()) {
-          console.warn(
-            '[STREAM] Processing leftover buffer at end:',
-            buffer.slice(0, 100)
-          );
-
           for (const line of buffer.split('\n')) {
             processLine(line);
           }
         }
 
         if (!doneSent) {
-          res.write('data: [DONE]\n\n');
+          safeWrite(res, 'data: [DONE]\n\n');
         }
 
         streamEndedCleanly = true;
-        res.end();
-      });
-
-      response.data.on('error', err => {
-        console.error('[STREAM] Upstream error:', err.message);
-
         if (!res.writableEnded) {
-          res.write(
-            `data: ${JSON.stringify({
-              error: {
-                message: 'Stream interrupted',
-                type: 'stream_error'
-              }
-            })}\n\n`
-          );
-
-          res.write('data: [DONE]\n\n');
           res.end();
         }
+        cleanup();
+      });
+
+      upstreamStream.on('error', err => {
+        console.error('[STREAM] Upstream error:', err.message);
+        
+        if (!res.writableEnded) {
+          safeWrite(res, `data: ${JSON.stringify({
+            error: {
+              message: 'Stream interrupted by upstream error',
+              type: 'stream_error'
+            }
+          })}\n\n`);
+          safeWrite(res, 'data: [DONE]\n\n');
+          res.end();
+        }
+        cleanup();
       });
 
       req.on('close', () => {
-        if (!streamEndedCleanly) {
+        const clientGone = req.destroyed || !res.writable;
+        
+        if (!streamEndedCleanly && clientGone) {
           console.warn('[STREAM] Client disconnected prematurely');
         }
 
-        if (response.data && !response.data.destroyed) {
-          response.data.destroy();
+        if (upstreamStream && !upstreamStream.destroyed && !streamEndedCleanly) {
+          upstreamStream.destroy();
         }
+        cleanup();
       });
 
     } else {
@@ -445,20 +592,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
         model: model,
-
         choices: (response.data.choices || []).map((choice, i) => {
-          let content = choice.message?.content || '';
-
-          if (
-            SHOW_REASONING &&
-            choice.message?.reasoning_content
-          ) {
-            const safeReasoning =
-              choice.message.reasoning_content.replace(/\n/g, '\\n');
-
-            content =
-              `<thinking>\n${safeReasoning}\n</thinking>\n\n${content}`;
-          }
+          const { content: extractedContent, reasoning } = extractThinkingContent(choice.message);
+          let content = formatWithReasoning(extractedContent, reasoning, SHOW_REASONING);
 
           return {
             index: i,
@@ -470,7 +606,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             finish_reason: choice.finish_reason || 'stop'
           };
         }),
-
         usage: response.data.usage || {
           prompt_tokens: 0,
           completion_tokens: 0,
@@ -481,7 +616,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.json(openaiResponse);
     }
 
-  } catch (error) {
+    } catch (error) {
     console.error('[PROXY] Fatal error:', error.message);
     console.error('[PROXY] NIM response:', error.response?.data);
 
@@ -493,34 +628,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           code: error.response?.status || 500
         }
       });
-
     } else if (!res.writableEnded) {
-      res.write(
-        `data: ${JSON.stringify({
-          error: {
-            message: error.message,
-            type: 'proxy_error'
-          }
-        })}\n\n`
-      );
-
-      res.write('data: [DONE]\n\n');
-      res.end();
-    }
-  }
-});
-
-app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`[PROXY] Hybrid proxy running on port ${PORT}`);
-  console.log(`[PROXY] Max tokens limit: ${MAX_TOKENS_LIMIT}`);
-});
+      safeWrite(res, `data: ${JSON.stringify({
+        error: {
+          message: error.message,
+          type: 'proxy_
